@@ -124,7 +124,7 @@ def calculate_targets(entry_price):
     return tp1, tp2, tp3
 
 
-def run_signal_check(symbol, candles_pump, candles_recent, funding_rate):
+def run_signal_check(symbol, candles_pump, candles_recent, funding_rate, oi_value_usd=0, oi_change_usd_6h=0):
     """
     Run all signal conditions.
     Returns signal dict if all conditions pass, else None.
@@ -165,16 +165,18 @@ def run_signal_check(symbol, candles_pump, candles_recent, funding_rate):
         pattern = "Lower High + Double Top"
 
     return {
-        "symbol":         symbol,
-        "pattern":        pattern,
-        "pump_pct":       pump_pct,
-        "resolution":     CANDLE_RESOLUTION,
-        "entry_price":    round(entry_price, 6),
-        "sl":             round(sl, 6),
-        "tp1":            tp1,
-        "tp2":            tp2,
-        "tp3":            tp3,
-        "current_volume": current_vol,
-        "avg_volume":     avg_vol,
-        "funding_rate":   funding_rate
+        "symbol":           symbol,
+        "pattern":          pattern,
+        "pump_pct":         pump_pct,
+        "resolution":       CANDLE_RESOLUTION,
+        "entry_price":      round(entry_price, 6),
+        "sl":               round(sl, 6),
+        "tp1":              tp1,
+        "tp2":              tp2,
+        "tp3":              tp3,
+        "current_volume":   current_vol,
+        "avg_volume":       avg_vol,
+        "funding_rate":     funding_rate,
+        "oi_value_usd":     oi_value_usd,       # NEW
+        "oi_change_usd_6h": oi_change_usd_6h    # NEW
     }

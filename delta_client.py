@@ -190,3 +190,29 @@ def get_funding_rate(symbol):
     except Exception as e:
         print(f"[ERROR] get_funding_rate({symbol}): {e}")
         return None
+
+
+def get_oi_data(symbol):
+    """
+    Fetch OI value (USD) and OI 6H change (USD) from ticker.
+    Returns (oi_value_usd, oi_change_usd_6h) as floats.
+    Returns (0, 0) if unavailable.
+    """
+    try:
+        response = requests.get(
+            f"{BASE_URL}/v2/tickers/{symbol}",
+            timeout=10
+        )
+        data = response.json()
+
+        if not data.get("success"):
+            return 0, 0
+
+        result           = data.get("result", {})
+        oi_value_usd     = float(result.get("oi_value_usd", 0) or 0)
+        oi_change_usd_6h = float(result.get("oi_change_usd_6h", 0) or 0)
+        return oi_value_usd, oi_change_usd_6h
+
+    except Exception as e:
+        print(f"[ERROR] get_oi_data({symbol}): {e}")
+        return 0, 0
