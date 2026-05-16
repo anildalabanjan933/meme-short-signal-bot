@@ -5,13 +5,14 @@
 #
 # Matches TradingView PnF [ATR(14), 3] chart exactly
 #
-# Settings:
-#   Box Size   : ATR(14) based
-#   Reversal   : 3 boxes
-#   Resolution : 5m candles
+# 4 Conditions (in order from screenshot):
+#   1st: Double Top OR Higher Low (exhaustion — informational)
+#   2nd: Min 3 rising O-bottom touch points + bullish trendline break
+#   3rd: Sudden pump >20% dynamic lookback (close-based)
+#   4th: PnF Double Bottom Sell + Price breaks below 10 SMA
 #
-# Exhaustion (double top / higher low) = informational only
-# Trendline break = main hard trigger
+# Other hard gates: Volume > avg, OI rising
+# Informational: Exhaustion type, Funding direction
 # -------------------------------------------------------
 
 import time
@@ -21,18 +22,16 @@ import requests
 # CONSTANTS
 # -------------------------------------------------------
 
-BASE_URL = "https://api.india.delta.exchange"
+from config import BASE_URL, CANDLE_RESOLUTION
 
-ATR_PERIOD     = 14        # ATR period for box size
-REVERSAL_BOXES = 3         # 3-box reversal rule
-
-PUMP_THRESHOLD = 20.0      # minimum 20% pump in 48h
-
-CANDLE_RESOLUTION     = "5m"
-CANDLES_48H           = 576   # 48h of 5m candles
-CANDLES_FETCH         = 700   # extra for ATR warmup
-MIN_TRENDLINE_TOUCHES = 3     # minimum rising O bottom touch points
-AVG_VOLUME_PERIOD     = 20    # candles for average volume
+ATR_PERIOD            = 14
+REVERSAL_BOXES        = 3
+PUMP_THRESHOLD        = 20.0      # minimum % pump
+CANDLES_FETCH         = 700       # extra for ATR warmup
+CANDLES_1D            = 288       # 1 day x 5m candles (used for days calc)
+MIN_TRENDLINE_TOUCHES = 3
+AVG_VOLUME_PERIOD     = 20
+SMA_PERIOD            = 10        # 10 SMA for condition 4
 
 
 # -------------------------------------------------------
@@ -97,7 +96,7 @@ def compute_atr(candles: list, period: int = ATR_PERIOD) -> float:
         abs(high - prev_close)
         abs(low  - prev_close)
 
-    ATR = average of last `period` true ranges
+    ATR = simple average of last `period` true ranges
     """
     if len(candles) < period + 1:
         return 0.0
@@ -119,29 +118,47 @@ def compute_atr(candles: list, period: int = ATR_PERIOD) -> float:
 
 
 # -------------------------------------------------------
+# 10 SMA CALCULATION
+# -------------------------------------------------------
+
+def compute_sma(candles: list, period: int = SMA_PERIOD) -> float:
+    """
+    Compute Simple Moving Average of close prices.
+    Uses last `period` candles.
+    """
+    if len(candles) < period:
+        return 0.0
+    closes = [c["close"] for c in candles[-period:]]
+    return sum(closes) / len(closes)
+
+
+# -------------------------------------------------------
 # POINT & FIGURE ENGINE
 # -------------------------------------------------------
 
-def build_pnf_chart(candles: list) -> list:
+def build_pnf_chart(candles: list) -> tuple:
     """
     Build PnF chart using ATR(14) box sizing.
     Matches TradingView PnF [ATR(14), 3] exactly.
 
-    Returns list of columns:
+    Returns:
+        (columns, box_size)
+
+    Each column:
         {
             "direction" : "X" or "O",
             "boxes"     : list of price levels,
             "top"       : highest level,
             "bottom"    : lowest level,
-            "col_index" : position in column list
+            "col_index" : sequential index
         }
     """
     if len(candles) < ATR_PERIOD + 2:
-        return []
+        return [], 0.0
 
     box_size = compute_atr(candles, ATR_PERIOD)
     if box_size <= 0:
-        return []
+        return [], 0.0
 
     closes = [c["close"] for c in candles]
 
@@ -184,7 +201,7 @@ def build_pnf_chart(candles: list) -> list:
                 }
 
                 boxes_down = int((reversal_start - price) / box_size)
-                for _ in range(boxes_down):
+                for _ in range(max(boxes_down, 0)):
                     new_level = new_col["bottom"] - box_size
                     new_col["boxes"].append(new_level)
                     new_col["bottom"] = new_level
@@ -215,7 +232,7 @@ def build_pnf_chart(candles: list) -> list:
                 }
 
                 boxes_up = int((price - reversal_start) / box_size)
-                for _ in range(boxes_up):
+                for _ in range(max(boxes_up, 0)):
                     new_level = new_col["top"] + box_size
                     new_col["boxes"].append(new_level)
                     new_col["top"] = new_level
@@ -226,47 +243,34 @@ def build_pnf_chart(candles: list) -> list:
     if current_column["boxes"]:
         columns.append(current_column)
 
-    return columns
+    return columns, box_size
 
 
 # -------------------------------------------------------
-# PnF PATTERN CHECKS
+# CONDITION 1 — EXHAUSTION (INFORMATIONAL ONLY)
+# Double Top OR Higher Low
 # -------------------------------------------------------
-
-def has_bullish_uptrend(columns: list) -> bool:
-    """
-    Confirm bullish uptrend:
-    At least 2 X columns with each top higher than previous.
-    """
-    x_cols = [c for c in columns if c["direction"] == "X"]
-    if len(x_cols) < 2:
-        return False
-
-    rising = sum(
-        1 for i in range(1, len(x_cols))
-        if x_cols[i]["top"] > x_cols[i - 1]["top"]
-    )
-    return rising >= 2
-
 
 def detect_exhaustion(columns: list, box_size: float) -> str:
     """
-    Detect exhaustion near top — INFORMATIONAL ONLY.
-    Does NOT block signal. Just labels what is happening.
+    CONDITION 1 — Informational only. Does NOT block signal.
+
+    Double Top  : Last two X column tops are equal (within 1.5 box tolerance)
+    Higher Low  : Last O column bottom is higher than previous O column bottom
 
     Returns: "Double Top", "Higher Low", or "None"
     """
     x_cols = [c for c in columns if c["direction"] == "X"]
     o_cols = [c for c in columns if c["direction"] == "O"]
 
-    # Double top: last two X tops equal within 1.5 box tolerance
+    # Double Top check
     if len(x_cols) >= 2:
         last_top = x_cols[-1]["top"]
         prev_top = x_cols[-2]["top"]
         if abs(last_top - prev_top) <= box_size * 1.5:
             return "Double Top"
 
-    # Higher low: last O bottom higher than previous O bottom
+    # Higher Low check
     if len(o_cols) >= 2:
         if o_cols[-1]["bottom"] > o_cols[-2]["bottom"]:
             return "Higher Low"
@@ -274,12 +278,23 @@ def detect_exhaustion(columns: list, box_size: float) -> str:
     return "None"
 
 
+# -------------------------------------------------------
+# CONDITION 2 — TRENDLINE: MIN 3 RISING O-BOTTOM TOUCH POINTS
+# -------------------------------------------------------
+
 def build_bullish_trendline(columns: list) -> dict | None:
     """
-    Build bullish support trendline from rising O column bottoms.
-    Matches the cyan diagonal line in your chart.
+    CONDITION 2 — Hard gate.
 
-    Requires minimum 3 rising O bottom touch points.
+    Build bullish support trendline from rising O column bottoms.
+    Matches the cyan diagonal rising trendline in the chart.
+
+    Logic:
+    - Collect all O column bottoms
+    - Find the BEST rising sequence (most touch points, most recent)
+      by trying every possible starting O bottom
+    - Require minimum 3 rising touch points
+    - Project trendline support to current column index
 
     Returns:
         {
@@ -287,7 +302,7 @@ def build_bullish_trendline(columns: list) -> dict | None:
             "slope"        : price per column step,
             "last_support" : projected support at latest column
         }
-        or None.
+        or None if not enough rising touch points.
     """
     o_bottoms = [
         (col["col_index"], col["bottom"])
@@ -298,28 +313,36 @@ def build_bullish_trendline(columns: list) -> dict | None:
     if len(o_bottoms) < MIN_TRENDLINE_TOUCHES:
         return None
 
-    # Keep only rising sequence
-    rising = [o_bottoms[0]]
-    for i in range(1, len(o_bottoms)):
-        if o_bottoms[i][1] > rising[-1][1]:
-            rising.append(o_bottoms[i])
+    best_rising = []
 
-    if len(rising) < MIN_TRENDLINE_TOUCHES:
+    for start_idx in range(len(o_bottoms)):
+        rising = [o_bottoms[start_idx]]
+        for i in range(start_idx + 1, len(o_bottoms)):
+            if o_bottoms[i][1] > rising[-1][1]:
+                rising.append(o_bottoms[i])
+
+        if len(rising) >= MIN_TRENDLINE_TOUCHES:
+            if (len(rising) > len(best_rising) or
+                (len(rising) == len(best_rising) and
+                 rising[-1][0] > best_rising[-1][0])):
+                best_rising = rising
+
+    if len(best_rising) < MIN_TRENDLINE_TOUCHES:
         return None
 
-    first    = rising[0]
-    last     = rising[-1]
+    first    = best_rising[0]
+    last     = best_rising[-1]
     col_span = last[0] - first[0]
 
     if col_span == 0:
         return None
 
-    slope            = (last[1] - first[1]) / col_span
-    current_col_idx  = columns[-1]["col_index"]
-    last_support     = first[1] + slope * (current_col_idx - first[0])
+    slope        = (last[1] - first[1]) / col_span
+    current_idx  = columns[-1]["col_index"]
+    last_support = first[1] + slope * (current_idx - first[0])
 
     return {
-        "touch_points": rising,
+        "touch_points": best_rising,
         "slope":        slope,
         "last_support": last_support
     }
@@ -327,12 +350,12 @@ def build_bullish_trendline(columns: list) -> dict | None:
 
 def check_trendline_breakdown(columns: list, trendline: dict, current_price: float) -> bool:
     """
-    Confirm bearish breakdown below bullish PnF trendline.
+    CONDITION 2 continued — Hard gate.
 
-    ALL must be true:
+    Trendline breakdown confirmed when:
     1. Current price < projected trendline support
-    2. Latest column is O column
-    3. O column has >= REVERSAL_BOXES boxes (confirmed reversal)
+    2. Latest column is O column (bearish)
+    3. O column has >= REVERSAL_BOXES boxes (3-box reversal confirmed)
     """
     if not trendline or not columns:
         return False
@@ -346,29 +369,105 @@ def check_trendline_breakdown(columns: list, trendline: dict, current_price: flo
 
 
 # -------------------------------------------------------
-# SUPPORTING CONDITIONS
+# CONDITION 3 — SUDDEN PUMP — DYNAMIC LOOKBACK
 # -------------------------------------------------------
 
-def check_48h_pump(candles: list) -> tuple[bool, float]:
+def check_sudden_pump(candles: list) -> tuple:
     """
-    Check pump > 20% in last 48h.
+    CONDITION 3 — Hard gate.
+
+    Dynamically scans ALL available candle history to find where
+    the pump actually started — not a fixed window.
+
+    Logic:
+    - Scan all candles from oldest to newest
+    - Find the lowest close price across all available history
+    - Calculate pump % from that lowest close to current close
+    - If pump >= PUMP_THRESHOLD, condition passes
+    - Calculate how many days ago that lowest point was
+
+    This means:
+    - If pump started 1 day ago -> shows 1d
+    - If pump started 3 days ago -> shows 3d
+    - If pump started a week ago -> shows 7d
+    - No fixed cap on lookback window
+
+    Returns:
+        (pumped: bool, pump_pct: float, days_ago: float)
     """
-    if len(candles) < 2:
-        return False, 0.0
+    if len(candles) < 10:
+        return False, 0.0, 0.0
 
-    window     = candles[-CANDLES_48H:] if len(candles) >= CANDLES_48H else candles
-    low_price  = min(c["low"]  for c in window)
-    high_price = max(c["high"] for c in window)
+    latest_close = candles[-1]["close"]
+    latest_time  = candles[-1]["time"]
 
-    if low_price <= 0:
-        return False, 0.0
+    # Find the lowest close across all available candles (excluding last candle)
+    lowest_close = None
+    lowest_time  = None
 
-    pump_pct = ((high_price - low_price) / low_price) * 100.0
-    return pump_pct >= PUMP_THRESHOLD, round(pump_pct, 2)
+    for candle in candles[:-1]:
+        close = candle["close"]
+        if lowest_close is None or close < lowest_close:
+            lowest_close = close
+            lowest_time  = candle["time"]
+
+    if lowest_close is None or lowest_close <= 0:
+        return False, 0.0, 0.0
+
+    pump_pct = ((latest_close - lowest_close) / lowest_close) * 100.0
+
+    # Calculate how many days ago the lowest point was
+    # candle time is in seconds (unix timestamp)
+    seconds_ago = latest_time - lowest_time
+    days_ago    = round(seconds_ago / 86400, 1)
+
+    pumped = pump_pct >= PUMP_THRESHOLD
+    return pumped, round(pump_pct, 2), days_ago
 
 
-def check_volume(candles: list) -> tuple[bool, float, float]:
+# -------------------------------------------------------
+# CONDITION 4 — PnF DOUBLE BOTTOM SELL + BREAK BELOW 10 SMA
+# -------------------------------------------------------
+
+def check_double_bottom_sell(columns: list) -> bool:
     """
+    CONDITION 4a — Hard gate.
+
+    PnF Double Bottom Sell Signal:
+    - Latest O column bottom is LOWER than previous O column bottom
+    - Confirms bearish momentum in PnF structure
+    """
+    o_cols = [c for c in columns if c["direction"] == "O"]
+
+    if len(o_cols) < 2:
+        return False
+
+    return o_cols[-1]["bottom"] < o_cols[-2]["bottom"]
+
+
+def check_below_10sma(candles: list) -> bool:
+    """
+    CONDITION 4b — Hard gate.
+
+    Price must break and close BELOW 10 SMA.
+    Signal confirmed when current close < 10 SMA.
+    """
+    if len(candles) < SMA_PERIOD:
+        return False
+
+    sma_10        = compute_sma(candles, SMA_PERIOD)
+    current_close = candles[-1]["close"]
+
+    return current_close < sma_10
+
+
+# -------------------------------------------------------
+# SUPPORTING HARD GATES
+# -------------------------------------------------------
+
+def check_volume(candles: list) -> tuple:
+    """
+    Volume hard gate.
     Latest candle volume must be above 20-candle average.
     """
     if len(candles) < AVG_VOLUME_PERIOD + 1:
@@ -379,16 +478,6 @@ def check_volume(candles: list) -> tuple[bool, float, float]:
     latest_vol  = candles[-1]["volume"]
 
     return latest_vol > avg_vol, round(latest_vol, 2), round(avg_vol, 2)
-
-
-def check_latest_candle_red(candles: list) -> bool:
-    """
-    Latest candle must close red (close < open).
-    """
-    if not candles:
-        return False
-    last = candles[-1]
-    return last["close"] < last["open"]
 
 
 def check_oi_rising(symbol: str) -> bool:
@@ -403,14 +492,18 @@ def check_oi_rising(symbol: str) -> bool:
     return recent[-1]["close"] > recent[0]["close"]
 
 
+# -------------------------------------------------------
+# INFORMATIONAL — FUNDING
+# -------------------------------------------------------
+
 def check_funding(symbol: str) -> str:
     """
-    Funding rate direction from FUNDING:SYMBOL candles.
+    Funding rate direction — informational, affects verdict only.
 
     Returns:
-        "Longs Paying"  -> positive -> good for short
-        "Shorts Paying" -> negative -> caution
-        "Neutral"       -> near zero -> acceptable
+        "Longs Paying"  -> positive -> GOOD FOR SHORT
+        "Shorts Paying" -> negative -> AVOID SHORT
+        "Neutral"       -> near zero -> GOOD FOR SHORT
     """
     funding_candles = fetch_funding_candles(symbol)
     if not funding_candles:
@@ -434,95 +527,129 @@ def check_pnf_signal(symbol: str) -> dict | None:
     """
     Full PnF Bearish Reversal Signal Check.
 
-    Hard conditions (ALL must pass):
-        1. 48h pump > 20%
-        2. PnF bullish uptrend confirmed
-        3. Bullish trendline built (min 3 rising O bottoms)
-        4. Trendline breakdown + confirmed O column
-        5. Volume above average
-        6. Latest candle red
-        7. OI rising
+    4 Main Conditions (in order):
+        1st: Double Top OR Higher Low     — INFORMATIONAL (shown in message)
+        2nd: Min 3 rising O-bottom touch points + trendline breakdown — HARD GATE
+        3rd: Sudden pump — dynamic lookback, finds actual pump origin  — HARD GATE
+        4th: PnF Double Bottom Sell + Break below 10 SMA               — HARD GATE
+
+    Additional Hard Gates:
+        - Volume above 20-candle average
+        - OI rising
 
     Informational (shown in message, does NOT block signal):
         - Exhaustion type: Double Top / Higher Low / None
         - Funding: Longs Paying / Shorts Paying / Neutral
 
+    Verdict:
+        - "Shorts Paying" funding -> AVOID SHORT
+        - All others              -> GOOD FOR SHORT
+
     Returns signal dict or None.
     """
 
-    # Step 1: Fetch candles
+    # --- Fetch candles ---
     candles = fetch_candles(symbol, CANDLE_RESOLUTION, CANDLES_FETCH)
     if len(candles) < ATR_PERIOD + 20:
         print(f"[PnF] {symbol}: Not enough candles ({len(candles)})")
         return None
 
-    # Step 2: Compute ATR box size
-    box_size = compute_atr(candles, ATR_PERIOD)
-    if box_size <= 0:
-        print(f"[PnF] {symbol}: ATR box size is zero, skipping")
+    # --- Build PnF chart ---
+    columns, box_size = build_pnf_chart(candles)
+    if len(columns) < 4 or box_size <= 0:
+        print(f"[PnF] {symbol}: Not enough PnF columns or zero box size")
         return None
 
-    # Step 3: Check 48h pump
-    pumped, pump_pct = check_48h_pump(candles)
-    if not pumped:
-        return None
-
-    # Step 4: Build PnF chart
-    columns = build_pnf_chart(candles)
-    if len(columns) < 4:
-        return None
-
-    # Step 5: Confirm bullish uptrend
-    if not has_bullish_uptrend(columns):
-        return None
-
-    # Step 6: Build bullish trendline (hard gate)
-    trendline = build_bullish_trendline(columns)
-    if trendline is None:
-        return None
-
-    # Step 7: Confirm trendline breakdown (hard gate)
-    current_price = candles[-1]["close"]
-    if not check_trendline_breakdown(columns, trendline, current_price):
-        return None
-
-    # Step 8: Volume above average (hard gate)
-    vol_ok, latest_vol, avg_vol = check_volume(candles)
-    if not vol_ok:
-        return None
-
-    # Step 9: Latest candle red (hard gate)
-    if not check_latest_candle_red(candles):
-        return None
-
-    # Step 10: OI rising (hard gate)
-    oi_rising = check_oi_rising(symbol)
-    if not oi_rising:
-        return None
-
-    # Step 11: Exhaustion — informational only
+    # -------------------------------------------------------
+    # CONDITION 1 — Exhaustion (INFORMATIONAL ONLY)
+    # -------------------------------------------------------
     exhaustion_type = detect_exhaustion(columns, box_size)
 
-    # Step 12: Funding — informational, affects verdict
+    # -------------------------------------------------------
+    # CONDITION 2 — Min 3 rising O-bottom touch points
+    #               + Trendline breakdown (HARD GATE)
+    # -------------------------------------------------------
+    trendline = build_bullish_trendline(columns)
+    if trendline is None:
+        print(f"[PnF] {symbol}: No valid bullish trendline (need {MIN_TRENDLINE_TOUCHES} rising O bottoms)")
+        return None
+
+    current_price = candles[-1]["close"]
+    if not check_trendline_breakdown(columns, trendline, current_price):
+        print(f"[PnF] {symbol}: Trendline not broken yet")
+        return None
+
+    # -------------------------------------------------------
+    # CONDITION 3 — Sudden pump dynamic lookback (HARD GATE)
+    # -------------------------------------------------------
+    pumped, pump_pct, pump_days = check_sudden_pump(candles)
+    if not pumped:
+        print(f"[PnF] {symbol}: Pump {pump_pct:.2f}% < {PUMP_THRESHOLD}% threshold")
+        return None
+
+    # -------------------------------------------------------
+    # CONDITION 4 — PnF Double Bottom Sell + Break below 10 SMA
+    #               (HARD GATE — BOTH must pass)
+    # -------------------------------------------------------
+    if not check_double_bottom_sell(columns):
+        print(f"[PnF] {symbol}: No PnF double bottom sell signal")
+        return None
+
+    if not check_below_10sma(candles):
+        print(f"[PnF] {symbol}: Price not below 10 SMA")
+        return None
+
+    # -------------------------------------------------------
+    # ADDITIONAL HARD GATES
+    # -------------------------------------------------------
+
+    vol_ok, latest_vol, avg_vol = check_volume(candles)
+    if not vol_ok:
+        print(f"[PnF] {symbol}: Volume too low ({latest_vol} < avg {avg_vol})")
+        return None
+
+    oi_rising = check_oi_rising(symbol)
+    if not oi_rising:
+        print(f"[PnF] {symbol}: OI not rising")
+        return None
+
+    # -------------------------------------------------------
+    # INFORMATIONAL — Funding
+    # -------------------------------------------------------
     funding = check_funding(symbol)
 
-    # Step 13: Verdict
-    verdict = "AVOID SHORT" if funding == "Shorts Paying" else "GOOD FOR SHORT"
+    # -------------------------------------------------------
+    # VERDICT
+    # -------------------------------------------------------
+    if funding == "Shorts Paying":
+        verdict = "AVOID SHORT"
+    else:
+        verdict = "GOOD FOR SHORT"
 
-    # Step 14: Levels
+    # -------------------------------------------------------
+    # PRICE LEVELS
+    # SL  : +5% above entry
+    # TP1 : -30% from entry
+    # TP2 : -50% from entry
+    # TP3 : -70% from entry
+    # -------------------------------------------------------
     entry     = current_price
-    stop_loss = round(entry * 1.05, 6)
-    tp1       = round(entry * 0.70, 6)
-    tp2       = round(entry * 0.50, 6)
-    tp3       = round(entry * 0.30, 6)
+    stop_loss = round(entry * 1.05, 8)
+    tp1       = round(entry * 0.70, 8)
+    tp2       = round(entry * 0.50, 8)
+    tp3       = round(entry * 0.30, 8)
 
+    # -------------------------------------------------------
+    # SIGNAL DICT
+    # -------------------------------------------------------
     return {
         "symbol":          symbol,
         "pattern":         "PnF Bullish Trendline Break",
         "trendline_break": True,
         "pump_pct":        pump_pct,
+        "pump_days":       pump_days,
         "exhaustion_type": exhaustion_type,
-        "box_size_atr":    round(box_size, 6),
+        "box_size_atr":    round(box_size, 8),
         "volume":          latest_vol,
         "avg_volume":      avg_vol,
         "oi_rising":       oi_rising,
@@ -544,20 +671,18 @@ def scan_pnf_signals(symbols: list) -> list:
     """
     Scan list of symbols for PnF short signals.
     Returns only triggered signal dicts.
-
-    Usage in main.py:
-        from pnf_signal_checker import scan_pnf_signals
-        pnf_signals = scan_pnf_signals(meme_coin_symbols)
-        for signal in pnf_signals:
-            send_pnf_signal(signal)
     """
     triggered = []
     for symbol in symbols:
         try:
             signal = check_pnf_signal(symbol)
             if signal:
-                print(f"[PnF] SIGNAL: {symbol} | {signal['pattern']} | "
-                      f"pump={signal['pump_pct']}% | exhaustion={signal['exhaustion_type']}")
+                print(
+                    f"[PnF] *** SIGNAL: {symbol} | {signal['pattern']} | "
+                    f"pump={signal['pump_pct']}% in {signal['pump_days']}d | "
+                    f"exhaustion={signal['exhaustion_type']} | "
+                    f"verdict={signal['verdict']} ***"
+                )
                 triggered.append(signal)
         except Exception as e:
             print(f"[PnF] Error scanning {symbol}: {e}")

@@ -46,7 +46,7 @@ DEMO_SYMBOLS = [
 
     # --- xStock / Metal Tokens ---
     "NVDAXUSD",      # NVIDIA xStock Token Perpetual
-    "XAUUSD",        # Tether Gold Token Perpetual
+    "XAUTUSD",       # Tether Gold Token Perpetual (XAUT)
     "PAXGUSD",       # PAX Gold Token Perpetual
 ]
 
@@ -59,13 +59,11 @@ def get_all_meme_symbols():
     and merges them with the base list.
     Returns list of symbol strings.
     """
-    # Start with verified demo list
-    symbols  = list(DEMO_SYMBOLS)
+    symbols   = list(DEMO_SYMBOLS)
     page_size = 100
     after     = None
     api_found = []
 
-    # Try to auto-discover new symbols via API
     while True:
         params = {
             "contract_types": "perpetual_futures",
@@ -96,11 +94,10 @@ def get_all_meme_symbols():
                 if product.get("state") != "live":
                     continue
 
-                symbol = product.get("symbol", "")
-                tags   = product.get("product_specs", {}).get("tags", [])
+                symbol  = product.get("symbol", "")
+                tags    = product.get("product_specs", {}).get("tags", [])
                 tag_set = {t.lower() for t in tags}
 
-                # Auto-add any new meme coins not in our list
                 if "meme" in tag_set and symbol not in symbols:
                     api_found.append(symbol)
                     print(f"[INFO] New meme coin discovered via API: {symbol}")
@@ -116,9 +113,7 @@ def get_all_meme_symbols():
 
         time.sleep(0.2)
 
-    # Merge new API-discovered symbols
     symbols.extend(api_found)
-
     print(f"[INFO] Total symbols to scan: {len(symbols)}")
     return symbols
 
@@ -143,6 +138,7 @@ def _resolution_to_seconds(resolution):
 def get_pump_candles(symbol):
     """
     Fetch candles covering PUMP_LOOKBACK_HRS for pump detection.
+    Used by original reversal bot (main.py PART 1).
     Always uses 1h resolution — faster and sufficient for pump check.
     Returns list of candle dicts: time, open, high, low, close, volume
     """
@@ -250,7 +246,7 @@ def get_funding_rate(symbol):
     Returns funding rate as float, or None if unavailable.
     """
     end_time   = int(time.time())
-    start_time = end_time - 7200   # 2 hours buffer
+    start_time = end_time - 7200
 
     try:
         response = requests.get(
